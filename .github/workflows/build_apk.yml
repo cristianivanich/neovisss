@@ -1,0 +1,110 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Tipo de compilación"
+        type: choice
+        options: [release, debug]
+        default: release
+
+env:
+  NDK_VERSION: "27.2.12479018"
+  BUILD_TOOLS: "35.0.0"
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle (con caché)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Instalar Android SDK, NDK y CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install \
+            "platforms;android-35" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # Oboe se descarga solo: Gradle baja com.google.oboe:oboe (AAR + Prefab) desde Maven de Google.
+
+      - name: Preparar keystore (solo release)
+        if: env.BUILD_TYPE == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Usando keystore de los secrets del repositorio"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            SP="$KEYSTORE_PASSWORD"; KA="$KEY_ALIAS"; KP="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "Sin secrets: generando keystore temporal (APK instalable, firma NO reutilizable)"
+            SP="matrixrain-ci"; KA="matrixrain"; KP="matrixrain-ci"
+            keytool -genkeypair -v -keystore "$KS" -storetype JKS -alias "$KA" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$SP" -keypass "$KP" -dname "CN=MatrixRain CI, O=MatrixRain, C=US"
+          fi
+          {
+            echo "RELEASE_STORE_FILE=$KS"
+            echo "RELEASE_STORE_PASSWORD=$SP"
+            echo "RELEASE_KEY_ALIAS=$KA"
+            echo "RELEASE_KEY_PASSWORD=$KP"
+          } >> "$GITHUB_ENV"
+
+      - name: Compilar APK
+        run: |
+          if [ "$BUILD_TYPE" = "release" ]; then
+            gradle --no-daemon :app:assembleRelease \
+              -PRELEASE_STORE_FILE="$RELEASE_STORE_FILE" \
+              -PRELEASE_STORE_PASSWORD="$RELEASE_STORE_PASSWORD" \
+              -PRELEASE_KEY_ALIAS="$RELEASE_KEY_ALIAS" \
+              -PRELEASE_KEY_PASSWORD="$RELEASE_KEY_PASSWORD"
+          else
+            gradle --no-daemon :app:assembleDebug
+          fi
+
+      - name: Verificar contenido del APK
+        run: |
+          APK=$(ls app/build/outputs/apk/${BUILD_TYPE}/*.apk | head -n1)
+          echo "APK: $APK"
+          unzip -l "$APK" | grep -E "shaders/.*\.spv|atlas/.*\.png|libmatrixrain\.so|liboboe\.so|libc\+\+_shared\.so"
+          for f in matrix.vert.spv matrix.frag.spv bloom.frag.spv; do
+            unzip -l "$APK" | grep -q "shaders/$f" || { echo "::error::Falta shaders/$f en el APK"; exit 1; }
+          done
+          if [ "$BUILD_TYPE" = "release" ]; then
+            "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" verify --print-certs "$APK"
+          fi
+
+      - name: Subir APK como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MatrixRain-${{ env.BUILD_TYPE }}-apk
+          path: app/build/outputs/apk/${{ env.BUILD_TYPE }}/*.apk
+          if-no-files-found: error
+          retention-days: 30
